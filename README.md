@@ -23,17 +23,6 @@ It keeps existing behavior unchanged:
    - `echo 1500 > /sys/class/pwm/pwmchip0/pwm0/duty_us`
    - `cat /sys/class/pwm/pwmchip0/pwm0/duty_us`
 
-## Migration Notes (from previous test setup)
-
-Previous test setup:
-- Patch was carried via `linux-patcher`.
-
-Current standalone setup:
-- Patch is carried only by this package:
-  - `package/infinity6e-pwm/patches/0001-pwm-add-duty_us-sysfs-for-sigmastar.patch`
-- `infinity6e-pwm.mk` applies its own patch directory directly through `LINUX_PATCHES`.
-- No `linux-patcher` coupling or duplicate-protection logic is included.
-
 ## Code-Level Changes Included In The Patch
 
 - Generic PWM framework:
