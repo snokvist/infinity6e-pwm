@@ -1,0 +1,9 @@
+config BR2_PACKAGE_INFINITY6E_PWM
+	bool "infinity6e pwm"
+	depends on BR2_LINUX_KERNEL
+	help
+	  Standalone SigmaStar Infinity6E PWM patch package.
+	  Adds fine duty pulse-width control in microseconds via:
+	    /sys/class/pwm/pwmchipX/pwmY/duty_us
+
+	  Existing period and duty_cycle behavior remains unchanged.

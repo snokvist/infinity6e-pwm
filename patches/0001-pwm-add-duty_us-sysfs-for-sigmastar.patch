@@ -1,0 +1,341 @@
+--- a/include/linux/pwm.h
++++ b/include/linux/pwm.h
+@@ -244,6 +244,8 @@
+  * @config: configure duty cycles and period length for this PWM
+  * @set_polarity: configure the polarity of this PWM
+  * @capture: capture and report PWM signal
++ * @set_duty_us: configure duty pulse width in microseconds (optional)
++ * @get_duty_us: report duty pulse width in microseconds (optional)
+  * @enable: enable PWM output toggling
+  * @disable: disable PWM output toggling
+  * @apply: atomically apply a new PWM config. The state argument
+@@ -265,6 +267,10 @@
+ 			    enum pwm_polarity polarity);
+ 	int (*capture)(struct pwm_chip *chip, struct pwm_device *pwm,
+ 		       struct pwm_capture *result, unsigned long timeout);
++	int (*set_duty_us)(struct pwm_chip *chip, struct pwm_device *pwm,
++			   unsigned int duty_us);
++	int (*get_duty_us)(struct pwm_chip *chip, struct pwm_device *pwm,
++			   unsigned int *duty_us);
+ 	int (*enable)(struct pwm_chip *chip, struct pwm_device *pwm);
+ 	void (*disable)(struct pwm_chip *chip, struct pwm_device *pwm);
+ 	int (*apply)(struct pwm_chip *chip, struct pwm_device *pwm,
+@@ -429,6 +435,8 @@
+ /* PWM provider APIs */
+ int pwm_capture(struct pwm_device *pwm, struct pwm_capture *result,
+ 		unsigned long timeout);
++int pwm_set_duty_us(struct pwm_device *pwm, unsigned int duty_us);
++int pwm_get_duty_us(struct pwm_device *pwm, unsigned int *duty_us);
+ int pwm_set_chip_data(struct pwm_device *pwm, void *data);
+ void *pwm_get_chip_data(struct pwm_device *pwm);
+ 
+@@ -486,6 +494,17 @@
+ {
+ 	return -EINVAL;
+ }
++
++static inline int pwm_set_duty_us(struct pwm_device *pwm, unsigned int duty_us)
++{
++	return -EINVAL;
++}
++
++static inline int pwm_get_duty_us(struct pwm_device *pwm,
++				  unsigned int *duty_us)
++{
++	return -EINVAL;
++}
+ 
+ static inline int pwm_set_polarity(struct pwm_device *pwm,
+ 				   enum pwm_polarity polarity)
+--- a/drivers/pwm/core.c
++++ b/drivers/pwm/core.c
+@@ -556,6 +556,49 @@
+ }
+ EXPORT_SYMBOL_GPL(pwm_capture);
+ 
++int pwm_set_duty_us(struct pwm_device *pwm, unsigned int duty_us)
++{
++	struct pwm_state state;
++	u64 duty_ns;
++	int err;
++
++	if (!pwm || !pwm->chip || !pwm->chip->ops)
++		return -EINVAL;
++
++	if (pwm->chip->ops->set_duty_us) {
++		err = pwm->chip->ops->set_duty_us(pwm->chip, pwm, duty_us);
++		if (!err && pwm->chip->ops->get_state)
++			pwm->chip->ops->get_state(pwm->chip, pwm, &pwm->state);
++		return err;
++	}
++
++	duty_ns = (u64)duty_us * 1000ULL;
++	if (duty_ns > UINT_MAX)
++		return -ERANGE;
++
++	pwm_get_state(pwm, &state);
++	state.duty_cycle = (unsigned int)duty_ns;
++	return pwm_apply_state(pwm, &state);
++}
++EXPORT_SYMBOL_GPL(pwm_set_duty_us);
++
++int pwm_get_duty_us(struct pwm_device *pwm, unsigned int *duty_us)
++{
++	struct pwm_state state;
++
++	if (!pwm || !pwm->chip || !pwm->chip->ops || !duty_us)
++		return -EINVAL;
++
++	if (pwm->chip->ops->get_duty_us)
++		return pwm->chip->ops->get_duty_us(pwm->chip, pwm, duty_us);
++
++	pwm_get_state(pwm, &state);
++	*duty_us = DIV_ROUND_CLOSEST_ULL((u64)state.duty_cycle, 1000ULL);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(pwm_get_duty_us);
++
+ /**
+  * pwm_adjust_config() - adjust the current PWM config to the PWM arguments
+  * @pwm: PWM device
+--- a/drivers/pwm/sysfs.c
++++ b/drivers/pwm/sysfs.c
+@@ -111,6 +111,41 @@
+ 	return ret ? : size;
+ }
+ 
++static ssize_t duty_us_show(struct device *child,
++			    struct device_attribute *attr,
++			    char *buf)
++{
++	struct pwm_device *pwm = child_to_pwm_device(child);
++	unsigned int duty_us = 0;
++	int ret;
++
++	ret = pwm_get_duty_us(pwm, &duty_us);
++	if (ret)
++		return ret;
++
++	return sprintf(buf, "%u\n", duty_us);
++}
++
++static ssize_t duty_us_store(struct device *child,
++			     struct device_attribute *attr,
++			     const char *buf, size_t size)
++{
++	struct pwm_export *export = child_to_pwm_export(child);
++	struct pwm_device *pwm = export->pwm;
++	unsigned int val;
++	int ret;
++
++	ret = kstrtouint(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	mutex_lock(&export->lock);
++	ret = pwm_set_duty_us(pwm, val);
++	mutex_unlock(&export->lock);
++
++	return ret ? : size;
++}
++
+ static ssize_t enable_show(struct device *child,
+ 			   struct device_attribute *attr,
+ 			   char *buf)
+@@ -225,6 +260,7 @@
+ 
+ static DEVICE_ATTR_RW(period);
+ static DEVICE_ATTR_RW(duty_cycle);
++static DEVICE_ATTR_RW(duty_us);
+ static DEVICE_ATTR_RW(enable);
+ static DEVICE_ATTR_RW(polarity);
+ static DEVICE_ATTR_RO(capture);
+@@ -232,6 +268,7 @@
+ static struct attribute *pwm_attrs[] = {
+ 	&dev_attr_period.attr,
+ 	&dev_attr_duty_cycle.attr,
++	&dev_attr_duty_us.attr,
+ 	&dev_attr_enable.attr,
+ 	&dev_attr_polarity.attr,
+ 	&dev_attr_capture.attr,
+--- a/drivers/sstar/pwm/mdrv_pwm.c
++++ b/drivers/sstar/pwm/mdrv_pwm.c
+@@ -158,11 +158,37 @@
+     state->enabled = enable;
+ }
+ 
++static int mstar_pwm_set_duty_us(struct pwm_chip *chip, struct pwm_device *pwm,
++				 unsigned int duty_us)
++{
++    struct mstar_pwm_chip *ms_pwm = to_mstar_pwm_chip(chip);
++
++    DrvPWMSetDutyUS(ms_pwm, pwm->hwpwm, duty_us);
++    return 0;
++}
++
++static int mstar_pwm_get_duty_us(struct pwm_chip *chip, struct pwm_device *pwm,
++				 unsigned int *duty_us)
++{
++    struct mstar_pwm_chip *ms_pwm = to_mstar_pwm_chip(chip);
++    U32 pulse_us = 0;
++
++    if (!duty_us)
++        return -EINVAL;
++
++    DrvPWMGetDutyUS(ms_pwm, pwm->hwpwm, &pulse_us);
++    *duty_us = pulse_us;
++
++    return 0;
++}
++
+ static const struct pwm_ops mstar_pwm_ops = {
+     .config = mstar_pwm_config,
+     .enable = mstar_pwm_enable,
+     .disable = mstar_pwm_disable,
+     .set_polarity = mstar_pwm_set_polarity,
++    .set_duty_us = mstar_pwm_set_duty_us,
++    .get_duty_us = mstar_pwm_get_duty_us,
+     .get_state = mstar_pwm_get_state,
+     .owner = THIS_MODULE,
+ };
+--- a/drivers/sstar/pwm/infinity6e/mhal_pwm.h
++++ b/drivers/sstar/pwm/infinity6e/mhal_pwm.h
+@@ -130,6 +130,8 @@
+ void DrvPWMSetDuty(struct mstar_pwm_chip *ms_chip, U8 u8Id, U32 u32Val);
+ void DrvPWMGetDuty(struct mstar_pwm_chip *ms_chip, U8 u8Id, U32* pu32Val);
+ #endif
++void DrvPWMSetDutyUS(struct mstar_pwm_chip *ms_chip, U8 u8Id, U32 pulse_us);
++void DrvPWMGetDutyUS(struct mstar_pwm_chip *ms_chip, U8 u8Id, U32 *pulse_us);
+ void DrvPWMEnable(struct mstar_pwm_chip *ms_chip, U8 u8Id, U8 u8Val);
+ void DrvPWMEnableGet(struct mstar_pwm_chip *ms_chip, U8 u8Id, U8* pu8Val);
+ void DrvPWMSetPolarity(struct mstar_pwm_chip *ms_chip, U8 u8Id, U8 u8Val);
+--- a/drivers/sstar/pwm/infinity6e/mhal_pwm.c
++++ b/drivers/sstar/pwm/infinity6e/mhal_pwm.c
+@@ -657,6 +657,126 @@
+     }
+ }
+ #endif
++
++void DrvPWMSetDutyUS(struct mstar_pwm_chip *ms_chip, U8 u8Id, U32 pulse_us)
++{
++#ifdef CONFIG_PWM_NEW
++    U32 period_ns = 0;
++    U64 duty_ns;
++
++    if (u8Id >= PWM_NUM)
++        return;
++
++    DrvPWMGetConfig(ms_chip, u8Id, NULL, &period_ns);
++    if (!period_ns)
++        return;
++
++    duty_ns = (U64)pulse_us * 1000ULL;
++    if (duty_ns > period_ns)
++        duty_ns = period_ns;
++
++    DrvPWMSetConfig(ms_chip, u8Id, (U32)duty_ns, period_ns);
++#else
++    U32 u32PwmAddr = 0, u32PwmOffs = 0;
++    U32 freq_hz = 0;
++    U32 period_ticks = 0;
++    U32 duty_ticks = 0;
++    U32 period_us;
++    U64 tmp;
++
++    if (PWM_NUM <= u8Id)
++        return;
++
++    DrvPWMGetGrpAddr(ms_chip, &u32PwmAddr, &u32PwmOffs, u8Id);
++    DrvPWMGetPeriod(ms_chip, u8Id, &freq_hz);
++    if (!freq_hz)
++        return;
++
++    period_ticks = _pwmPeriod[u8Id] + 1;
++    if (!period_ticks)
++        return;
++
++    period_us = (U32)((1000000ULL + (freq_hz / 2)) / freq_hz);
++    if (pulse_us > period_us)
++        pulse_us = period_us;
++
++    tmp = (U64)period_ticks * (U64)pulse_us * (U64)freq_hz;
++    duty_ticks = (U32)((tmp + 500000ULL) / 1000000ULL);
++    if (duty_ticks > period_ticks)
++        duty_ticks = period_ticks;
++
++    _pwmDutyeq0[u8Id] = (duty_ticks == 0) ? TRUE : FALSE;
++    MDEV_PWM_SetClock();
++    if (_pwmEnSatus[u8Id] && _pwmDutyeq0[u8Id])
++    {
++        OUTREGMSK16(u32PwmAddr + u16REG_SW_RESET,
++                    BIT0 << ((u8Id == 10) ? 0 : u8Id),
++                    BIT0 << ((u8Id == 10) ? 0 : u8Id));
++    }
++
++    OUTREG16(u32PwmAddr + u32PwmOffs + u16REG_PWM_DUTY_L, (duty_ticks & 0xFFFF));
++    OUTREG16(u32PwmAddr + u32PwmOffs + u16REG_PWM_DUTY_H, ((duty_ticks >> 16) & 0x3));
++
++    if (_pwmEnSatus[u8Id])
++    {
++        U32 reset = INREG16(u32PwmAddr + u16REG_SW_RESET) &
++                    (BIT0 << ((u8Id == 10) ? 0 : u8Id));
++        if (duty_ticks && reset)
++            CLRREG16(u32PwmAddr + u16REG_SW_RESET, BIT0 << ((u8Id == 10) ? 0 : u8Id));
++    }
++#endif
++}
++
++void DrvPWMGetDutyUS(struct mstar_pwm_chip *ms_chip, U8 u8Id, U32 *pulse_us)
++{
++    if (!pulse_us)
++        return;
++
++    *pulse_us = 0;
++
++    if (u8Id >= PWM_NUM)
++        return;
++
++#ifdef CONFIG_PWM_NEW
++    {
++        U32 duty_ns = 0;
++
++        DrvPWMGetConfig(ms_chip, u8Id, &duty_ns, NULL);
++        *pulse_us = (U32)((duty_ns + 500ULL) / 1000ULL);
++    }
++#else
++    {
++        U32 u32PwmAddr = 0, u32PwmOffs = 0;
++        U32 freq_hz = 0;
++        U32 period_ticks = 0;
++        U32 duty_ticks = 0;
++        U64 denom;
++        U64 tmp;
++
++        DrvPWMGetGrpAddr(ms_chip, &u32PwmAddr, &u32PwmOffs, u8Id);
++        DrvPWMGetPeriod(ms_chip, u8Id, &freq_hz);
++        if (!freq_hz)
++            return;
++
++        period_ticks = _pwmPeriod[u8Id] + 1;
++        if (!period_ticks)
++            return;
++
++        duty_ticks = INREG16(u32PwmAddr + u32PwmOffs + u16REG_PWM_DUTY_L) |
++            ((INREG16(u32PwmAddr + u32PwmOffs + u16REG_PWM_DUTY_H) & 0x3) << 16);
++        if (duty_ticks > period_ticks)
++            duty_ticks = period_ticks;
++
++        denom = (U64)period_ticks * (U64)freq_hz;
++        if (!denom)
++            return;
++
++        tmp = (U64)duty_ticks * 1000000ULL;
++        *pulse_us = (U32)((tmp + (denom / 2)) / denom);
++    }
++#endif
++}
++
+ //------------------------------------------------------------------------------
+ //
+ //  Function:   DrvPWMSetPolarity
