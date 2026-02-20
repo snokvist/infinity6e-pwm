@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -19,6 +20,7 @@
 #define RXBUF_SIZE 4096
 
 // CRSF (TBS spec)
+#define CRSF_ADDR_FLIGHT_CONTROLLER 0xC8
 #define CRSF_TYPE_RC_CHANNELS_PACKED 0x16
 
 static volatile sig_atomic_t g_stop = 0;
@@ -34,6 +36,9 @@ typedef struct {
     int hold_ms;           // hold last command before centering
     int center_timeout_ms; // center after no packets
     int verbose;
+    bool no_mux;
+    bool mux_init_once;
+    uint16_t mux_init_val;
     // SigmaStar mux values from your testing
     uint16_t mux_pwm0;     // 0x1102
     uint16_t mux_pwm1;     // 0x1121
@@ -84,20 +89,62 @@ static void usage(const char *argv0) {
         "  --center-us N         Center/failsafe us (default 1500)\n"
         "  --hold-ms N           Hold last value after link loss (default 300)\n"
         "  --center-timeout-ms N Center outputs after no valid frame (default 500)\n"
-        "  -v                    Verbose logs\n"
+        "  --no-mux              Do not write pin mux register (external setup)\n"
+        "  --mux-reg ADDR        Mux register address (default 0x1f207994)\n"
+        "  --mux-pwm0 VAL        Mux write value for pwm0 init (default 0x1102)\n"
+        "  --mux-pwm1 VAL        Mux write value for pwm1 init (default 0x1121)\n"
+        "  --mux-init-val VAL    One-shot mux write at startup; skips per-channel mux writes\n"
+        "                        (default auto for dual-channel: 0x1122)\n"
+        "  -v                    Verbose logs (packet + state)\n"
+        "  -vv                   More detail (frame counters + output updates)\n"
+        "  -vvv                  Very verbose (unchanged output skips)\n"
         "\n"
         "Examples:\n"
         "  %s --port 9000 --pwm0-ch 1 --pwm1-ch 2 -v\n"
-        "  %s --pwm0-ch 4 --pwm1-ch 0 --center-timeout-ms 500\n",
-        argv0, argv0, argv0);
+        "  %s --pwm0-ch 4 --pwm1-ch 0 --center-timeout-ms 500\n"
+        "  %s --no-mux --pwm0-ch 1 --pwm1-ch 2 -vv\n"
+        "  %s --mux-reg 0x1f207994 --mux-pwm0 0x1102 --mux-pwm1 0x1121\n"
+        "  %s --mux-init-val 0x1122 --pwm0-ch 1 --pwm1-ch 2 -vv\n",
+        argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static int parse_int(const char *s, int *out) {
+    if (!s || !out) return -1;
     char *end = NULL;
+    errno = 0;
     long v = strtol(s, &end, 0);
-    if (!s[0] || (end && *end)) return -1;
+    if (!s[0] || end == s || (end && *end) || errno == ERANGE || v < INT_MIN || v > INT_MAX) {
+        return -1;
+    }
     *out = (int)v;
     return 0;
+}
+
+static bool parse_opt_int_or_die(int argc, char **argv, int *i, int *dst, const char *opt) {
+    if (*i + 1 >= argc) {
+        fprintf(stderr, "Missing value for %s\n", opt);
+        return false;
+    }
+
+    const char *val = argv[++(*i)];
+    if (parse_int(val, dst) != 0) {
+        fprintf(stderr, "Invalid value for %s: %s\n", opt, val);
+        return false;
+    }
+    return true;
+}
+
+static bool parse_opt_u16_or_die(int argc, char **argv, int *i, uint16_t *dst, const char *opt) {
+    int tmp = 0;
+    if (!parse_opt_int_or_die(argc, argv, i, &tmp, opt)) {
+        return false;
+    }
+    if (tmp < 0 || tmp > 0xFFFF) {
+        fprintf(stderr, "Out of range for %s: %d (expected 0..65535)\n", opt, tmp);
+        return false;
+    }
+    *dst = (uint16_t)tmp;
+    return true;
 }
 
 static int write_str(const char *path, const char *s) {
@@ -129,9 +176,21 @@ static int export_pwm_if_needed(int ch) {
 }
 
 static int sigma_mux_set(const cfg_t *cfg, int pwm_ch) {
+    if (cfg->no_mux) {
+        return 0;
+    }
     char cmd[128];
     uint16_t val = (pwm_ch == 0) ? cfg->mux_pwm0 : cfg->mux_pwm1;
     // BusyBox shell-friendly one-shot
+    snprintf(cmd, sizeof(cmd), "devmem %s 16 0x%04x >/dev/null 2>&1", cfg->mux_reg, val);
+    return system(cmd);
+}
+
+static int sigma_mux_set_value(const cfg_t *cfg, uint16_t val) {
+    if (cfg->no_mux) {
+        return 0;
+    }
+    char cmd[128];
     snprintf(cmd, sizeof(cmd), "devmem %s 16 0x%04x >/dev/null 2>&1", cfg->mux_reg, val);
     return system(cmd);
 }
@@ -151,8 +210,19 @@ static int pwm_init_one(const cfg_t *cfg, pwm_out_t *o, int ch) {
     snprintf(o->enable_path, sizeof(o->enable_path), "%s/enable", o->path);
     snprintf(o->polarity_path, sizeof(o->polarity_path), "%s/polarity", o->path);
 
-    if (sigma_mux_set(cfg, ch) != 0 && cfg->verbose) {
+    if (cfg->no_mux) {
+        if (cfg->verbose) {
+            fprintf(stderr, "MUX: skipping write for pwm%d (--no-mux)\n", ch);
+        }
+    } else if (cfg->mux_init_once) {
+        if (cfg->verbose > 1) {
+            fprintf(stderr, "MUX: per-channel write skipped for pwm%d (--mux-init-val active)\n", ch);
+        }
+    } else if (sigma_mux_set(cfg, ch) != 0 && cfg->verbose) {
         fprintf(stderr, "WARN: devmem mux set failed for pwm%d (continuing)\n", ch);
+    } else if (cfg->verbose > 1) {
+        uint16_t val = (ch == 0) ? cfg->mux_pwm0 : cfg->mux_pwm1;
+        fprintf(stderr, "MUX: pwm%d -> %s = 0x%04x\n", ch, cfg->mux_reg, val);
     }
 
     if (export_pwm_if_needed(ch) != 0 && !path_exists(o->path)) {
@@ -192,16 +262,35 @@ static int pwm_init_one(const cfg_t *cfg, pwm_out_t *o, int ch) {
 }
 
 static void pwm_set_us(const cfg_t *cfg, pwm_out_t *o, int us) {
+    int requested_us = us;
     if (!o->available) return;
     if (us < cfg->min_us) us = cfg->min_us;
     if (us > cfg->max_us) us = cfg->max_us;
-    if (o->last_us == us) return;
+    if (o->last_us == us) {
+        if (cfg->verbose > 2) {
+            fprintf(stderr, "PWM%d unchanged: duty_us=%d\n", o->ch, us);
+        }
+        return;
+    }
     if (write_int_path(o->duty_us_path, us) == 0) {
+        if (cfg->verbose > 1) {
+            if (requested_us != us) {
+                fprintf(stderr, "PWM%d <- %dus (clamped from %dus)\n", o->ch, us, requested_us);
+            } else {
+                fprintf(stderr, "PWM%d <- %dus\n", o->ch, us);
+            }
+        }
         o->last_us = us;
+    } else if (cfg->verbose) {
+        fprintf(stderr, "PWM%d write failed for %s=%d: %s\n",
+                o->ch, o->duty_us_path, us, strerror(errno));
     }
 }
 
 static void pwm_center_all(const cfg_t *cfg, pwm_out_t *a, pwm_out_t *b) {
+    if (cfg->verbose) {
+        fprintf(stderr, "Centering PWM outputs to %dus\n", cfg->center_us);
+    }
     pwm_set_us(cfg, a, cfg->center_us);
     pwm_set_us(cfg, b, cfg->center_us);
 }
@@ -243,6 +332,11 @@ static bool crsf_unpack_rc16_11bit(const uint8_t *payload, size_t len, int out_u
 typedef struct {
     bool got_rc;
     int ch_us[16];
+    size_t frames_seen;
+    size_t frames_crc_ok;
+    size_t frames_bad_crc;
+    size_t frames_bad_addr;
+    size_t rc_frames;
 } crsf_parse_result_t;
 
 // Feed arbitrary bytes (UDP payload may contain partial/multiple frames)
@@ -266,6 +360,14 @@ static void crsf_stream_parse(stream_buf_t *sb, crsf_parse_result_t *res, int ve
     while (sb->len - i >= 4) { // sync + len + type + crc(min)
         uint8_t sync = sb->data[i + 0];
         uint8_t flen = sb->data[i + 1];
+        res->frames_seen++;
+
+        // RC data should target flight-controller address.
+        if (sync != CRSF_ADDR_FLIGHT_CONTROLLER) {
+            res->frames_bad_addr++;
+            i++;
+            continue;
+        }
 
         // Per spec: valid frame length field is 2..62
         if (flen < 2 || flen > 62) {
@@ -284,20 +386,22 @@ static void crsf_stream_parse(stream_buf_t *sb, crsf_parse_result_t *res, int ve
         uint8_t crc_calc = crsf_crc8(&f[2], (size_t)flen - 1); // type + payload
 
         if (crc_calc != crc_rx) {
+            res->frames_bad_crc++;
             // Not a valid frame at this byte offset; slide by one
             i++;
             continue;
         }
-
-        // Valid frame
-        (void)sync; // we accept any valid sync/address byte if CRC+length match
+        res->frames_crc_ok++;
 
         if (type == CRSF_TYPE_RC_CHANNELS_PACKED) {
-            if (crsf_unpack_rc16_11bit(payload, payload_len, res->ch_us)) {
+            if (payload_len == 22 && crsf_unpack_rc16_11bit(payload, payload_len, res->ch_us)) {
                 res->got_rc = true;
+                res->rc_frames++;
                 if (verbose > 1) {
                     fprintf(stderr, "CRSF RC frame parsed\n");
                 }
+            } else if (verbose > 1) {
+                fprintf(stderr, "CRSF RC frame ignored: invalid payload_len=%zu\n", payload_len);
             }
         }
 
@@ -316,6 +420,25 @@ static int clampi(int v, int lo, int hi) {
     return v;
 }
 
+static void log_udp_rx(int verbose, ssize_t n, const struct sockaddr_in *src, const crsf_parse_result_t *res) {
+    char ipbuf[INET_ADDRSTRLEN] = "?";
+    if (src) {
+        (void)inet_ntop(AF_INET, &src->sin_addr, ipbuf, sizeof(ipbuf));
+    }
+    unsigned int port = src ? (unsigned int)ntohs(src->sin_port) : 0U;
+
+    if (verbose > 1) {
+        fprintf(stderr,
+                "UDP rx: %zd bytes from %s:%u | frames=%zu crc_ok=%zu rc=%zu bad_addr=%zu bad_crc=%zu\n",
+                n, ipbuf, port,
+                res->frames_seen, res->frames_crc_ok, res->rc_frames,
+                res->frames_bad_addr, res->frames_bad_crc);
+    } else {
+        fprintf(stderr, "UDP rx: %zd bytes from %s:%u%s\n",
+                n, ipbuf, port, res->got_rc ? " (RC update)" : " (no RC)");
+    }
+}
+
 int main(int argc, char **argv) {
     cfg_t cfg = {
         .port = 9000,
@@ -328,22 +451,67 @@ int main(int argc, char **argv) {
         .hold_ms = 300,
         .center_timeout_ms = 500,
         .verbose = 0,
+        .no_mux = false,
+        .mux_init_once = false,
+        .mux_init_val = 0,
         .mux_pwm0 = 0x1102,
         .mux_pwm1 = 0x1121,
         .mux_reg = "0x1f207994",
     };
+    bool mux_strategy_explicit = false;
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--port") && i + 1 < argc) parse_int(argv[++i], &cfg.port);
-        else if (!strcmp(argv[i], "--pwm0-ch") && i + 1 < argc) parse_int(argv[++i], &cfg.pwm0_ch);
-        else if (!strcmp(argv[i], "--pwm1-ch") && i + 1 < argc) parse_int(argv[++i], &cfg.pwm1_ch);
-        else if (!strcmp(argv[i], "--hz") && i + 1 < argc) parse_int(argv[++i], &cfg.hz);
-        else if (!strcmp(argv[i], "--min-us") && i + 1 < argc) parse_int(argv[++i], &cfg.min_us);
-        else if (!strcmp(argv[i], "--max-us") && i + 1 < argc) parse_int(argv[++i], &cfg.max_us);
-        else if (!strcmp(argv[i], "--center-us") && i + 1 < argc) parse_int(argv[++i], &cfg.center_us);
-        else if (!strcmp(argv[i], "--hold-ms") && i + 1 < argc) parse_int(argv[++i], &cfg.hold_ms);
-        else if (!strcmp(argv[i], "--center-timeout-ms") && i + 1 < argc) parse_int(argv[++i], &cfg.center_timeout_ms);
-        else if (!strcmp(argv[i], "-v")) cfg.verbose++;
+        if (!strcmp(argv[i], "--port")) {
+            if (!parse_opt_int_or_die(argc, argv, &i, &cfg.port, "--port")) return 1;
+        } else if (!strcmp(argv[i], "--pwm0-ch")) {
+            if (!parse_opt_int_or_die(argc, argv, &i, &cfg.pwm0_ch, "--pwm0-ch")) return 1;
+        } else if (!strcmp(argv[i], "--pwm1-ch")) {
+            if (!parse_opt_int_or_die(argc, argv, &i, &cfg.pwm1_ch, "--pwm1-ch")) return 1;
+        } else if (!strcmp(argv[i], "--hz")) {
+            if (!parse_opt_int_or_die(argc, argv, &i, &cfg.hz, "--hz")) return 1;
+        } else if (!strcmp(argv[i], "--min-us")) {
+            if (!parse_opt_int_or_die(argc, argv, &i, &cfg.min_us, "--min-us")) return 1;
+        } else if (!strcmp(argv[i], "--max-us")) {
+            if (!parse_opt_int_or_die(argc, argv, &i, &cfg.max_us, "--max-us")) return 1;
+        } else if (!strcmp(argv[i], "--center-us")) {
+            if (!parse_opt_int_or_die(argc, argv, &i, &cfg.center_us, "--center-us")) return 1;
+        } else if (!strcmp(argv[i], "--hold-ms")) {
+            if (!parse_opt_int_or_die(argc, argv, &i, &cfg.hold_ms, "--hold-ms")) return 1;
+        } else if (!strcmp(argv[i], "--center-timeout-ms")) {
+            if (!parse_opt_int_or_die(argc, argv, &i, &cfg.center_timeout_ms, "--center-timeout-ms")) return 1;
+        } else if (!strcmp(argv[i], "--no-mux")) {
+            cfg.no_mux = true;
+            mux_strategy_explicit = true;
+        } else if (!strcmp(argv[i], "--mux-reg")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --mux-reg\n");
+                return 1;
+            }
+            cfg.mux_reg = argv[++i];
+        } else if (!strcmp(argv[i], "--mux-pwm0")) {
+            if (!parse_opt_u16_or_die(argc, argv, &i, &cfg.mux_pwm0, "--mux-pwm0")) return 1;
+            cfg.mux_init_once = false;
+            mux_strategy_explicit = true;
+        } else if (!strcmp(argv[i], "--mux-pwm1")) {
+            if (!parse_opt_u16_or_die(argc, argv, &i, &cfg.mux_pwm1, "--mux-pwm1")) return 1;
+            cfg.mux_init_once = false;
+            mux_strategy_explicit = true;
+        } else if (!strcmp(argv[i], "--mux-init-val")) {
+            if (!parse_opt_u16_or_die(argc, argv, &i, &cfg.mux_init_val, "--mux-init-val")) return 1;
+            cfg.mux_init_once = true;
+            mux_strategy_explicit = true;
+        }
+        else if (argv[i][0] == '-' && argv[i][1] == 'v') {
+            const char *p = &argv[i][1];
+            while (*p == 'v') {
+                cfg.verbose++;
+                p++;
+            }
+            if (*p != '\0') {
+                usage(argv[0]);
+                return 1;
+            }
+        }
         else {
             usage(argv[0]);
             return 1;
@@ -361,8 +529,25 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Default for known board behavior: dual-channel works with one combined mux write.
+    if (!cfg.no_mux && !mux_strategy_explicit && cfg.pwm0_ch > 0 && cfg.pwm1_ch > 0) {
+        cfg.mux_init_once = true;
+        cfg.mux_init_val = 0x1122;
+    }
+
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
+
+    if (!cfg.no_mux && cfg.mux_init_once) {
+        if (sigma_mux_set_value(&cfg, cfg.mux_init_val) != 0) {
+            if (cfg.verbose) {
+                fprintf(stderr, "WARN: one-shot mux write failed for %s=0x%04x (continuing)\n",
+                        cfg.mux_reg, cfg.mux_init_val);
+            }
+        } else if (cfg.verbose) {
+            fprintf(stderr, "MUX: one-shot write %s = 0x%04x\n", cfg.mux_reg, cfg.mux_init_val);
+        }
+    }
 
     pwm_out_t pwm0 = {0}, pwm1 = {0};
 
@@ -398,6 +583,15 @@ int main(int argc, char **argv) {
                 "Listening UDP :%d | pwm0<-CH%d pwm1<-CH%d | %dHz | clamp %d..%dus | center %dus | hold %dms center@%dms\n",
                 cfg.port, cfg.pwm0_ch, cfg.pwm1_ch, cfg.hz, cfg.min_us, cfg.max_us, cfg.center_us,
                 cfg.hold_ms, cfg.center_timeout_ms);
+        if (cfg.no_mux) {
+            fprintf(stderr, "MUX mode: disabled (--no-mux)\n");
+        } else if (cfg.mux_init_once) {
+            fprintf(stderr, "MUX mode: one-shot via %s = 0x%04x\n",
+                    cfg.mux_reg, cfg.mux_init_val);
+        } else {
+            fprintf(stderr, "MUX mode: per-channel writes via %s (pwm0=0x%04x pwm1=0x%04x)\n",
+                    cfg.mux_reg, cfg.mux_pwm0, cfg.mux_pwm1);
+        }
     }
 
     struct pollfd pfd = { .fd = sock, .events = POLLIN, .revents = 0 };
@@ -416,31 +610,52 @@ int main(int argc, char **argv) {
             break;
         }
 
+        if (pr > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            if (cfg.verbose) fprintf(stderr, "Socket error revents=0x%x, centering outputs\n", pfd.revents);
+            pwm_center_all(&cfg, &pwm0, &pwm1);
+            break;
+        }
+
         if (pr > 0 && (pfd.revents & POLLIN)) {
             uint8_t dgram[1500];
-            ssize_t n = recv(sock, dgram, sizeof(dgram), 0);
+            struct sockaddr_in src;
+            socklen_t src_len = sizeof(src);
+            memset(&src, 0, sizeof(src));
+            ssize_t n = recvfrom(sock, dgram, sizeof(dgram), 0, (struct sockaddr *)&src, &src_len);
             if (n > 0) {
                 crsf_stream_feed(&sb, dgram, (size_t)n);
 
                 crsf_parse_result_t res;
                 memset(&res, 0, sizeof(res));
                 crsf_stream_parse(&sb, &res, cfg.verbose);
+                if (cfg.verbose) {
+                    log_udp_rx(cfg.verbose, n, &src, &res);
+                }
 
                 if (res.got_rc) {
+                    if (centered_due_to_timeout && cfg.verbose) {
+                        fprintf(stderr, "Link recovered: valid RC frame received\n");
+                    }
                     last_valid_ms = now;
                     link_active = true;
                     centered_due_to_timeout = false;
 
                     if (cfg.pwm0_ch > 0 && pwm0.available) {
-                        int us = res.ch_us[cfg.pwm0_ch - 1];
-                        us = clampi(us, cfg.min_us, cfg.max_us);
-                        pwm_set_us(&cfg, &pwm0, us);
+                        int raw_us = res.ch_us[cfg.pwm0_ch - 1];
+                        int clamped_us = clampi(raw_us, cfg.min_us, cfg.max_us);
+                        if (cfg.verbose > 1) {
+                            fprintf(stderr, "Map: CH%d=%dus -> PWM0=%dus\n", cfg.pwm0_ch, raw_us, clamped_us);
+                        }
+                        pwm_set_us(&cfg, &pwm0, clamped_us);
                     }
 
                     if (cfg.pwm1_ch > 0 && pwm1.available) {
-                        int us = res.ch_us[cfg.pwm1_ch - 1];
-                        us = clampi(us, cfg.min_us, cfg.max_us);
-                        pwm_set_us(&cfg, &pwm1, us);
+                        int raw_us = res.ch_us[cfg.pwm1_ch - 1];
+                        int clamped_us = clampi(raw_us, cfg.min_us, cfg.max_us);
+                        if (cfg.verbose > 1) {
+                            fprintf(stderr, "Map: CH%d=%dus -> PWM1=%dus\n", cfg.pwm1_ch, raw_us, clamped_us);
+                        }
+                        pwm_set_us(&cfg, &pwm1, clamped_us);
                     }
 
                     if (cfg.verbose > 1) {
@@ -449,6 +664,19 @@ int main(int argc, char **argv) {
                                 cfg.pwm1_ch, (cfg.pwm1_ch ? res.ch_us[cfg.pwm1_ch - 1] : 0));
                     }
                 }
+            } else if (n == 0) {
+                if (cfg.verbose > 1) {
+                    fprintf(stderr, "recvfrom returned 0 bytes\n");
+                }
+            } else if (n < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                if (cfg.verbose) perror("recv");
+                // On socket receive errors, stop driving stale outputs.
+                if (!centered_due_to_timeout) {
+                    pwm_center_all(&cfg, &pwm0, &pwm1);
+                    centered_due_to_timeout = true;
+                }
+                link_active = false;
+                sb.len = 0;
             }
         }
 
