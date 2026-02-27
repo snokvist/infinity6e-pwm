@@ -1,6 +1,10 @@
 # infinity6e-pwm
 
 Standalone Buildroot package for SigmaStar Infinity6E PWM fine pulse-width control.
+<img width="617" height="514" alt="Screenshot From 2026-02-27 19-23-24" src="https://github.com/user-attachments/assets/3434208c-a2f6-47ec-8b2a-76ca3ab67b04" />
+<img width="506" height="427" alt="image" src="https://github.com/user-attachments/assets/cf92d50b-8bae-472e-916e-b550d8555cb4" />
+
+
 
 ## What This Package Adds
 
