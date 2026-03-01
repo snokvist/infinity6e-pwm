@@ -3,6 +3,8 @@ Standalone Buildroot package for SigmaStar Infinity6E PWM fine pulse-width contr
 
 # Sensors
 <img width="300" height="250" alt="Screenshot From 2026-02-27 19-23-24" src="https://github.com/user-attachments/assets/3434208c-a2f6-47ec-8b2a-76ca3ab67b04" />
+<img width="390" height="370" alt="image" src="https://github.com/user-attachments/assets/8620aa49-2da9-4b3b-8fd6-86d34f3924b0" />
+
 <img width="250" height="210" alt="image" src="https://github.com/user-attachments/assets/cf92d50b-8bae-472e-916e-b550d8555cb4" />
 
 ## What This Package Adds
