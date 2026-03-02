@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -18,6 +20,15 @@
 #define PWMCHIP "/sys/class/pwm/pwmchip0"
 #define MAX_CRSF_FRAME 64
 #define RXBUF_SIZE 4096
+
+// SSE server defaults
+#define SSE_DEFAULT_BIND "127.0.0.1"
+#define SSE_DEFAULT_PORT 8070
+#define SSE_DEFAULT_PATH "/sse"
+#define SSE_DEFAULT_RATE_HZ 10
+#define SSE_HANDSHAKE_TIMEOUT_MS 2000
+#define SSE_REQUEST_BUF 1024
+#define SSE_RESPONSE_BUF 512
 
 // CRSF (TBS spec)
 #define CRSF_ADDR_FLIGHT_CONTROLLER 0xC8
@@ -43,7 +54,24 @@ typedef struct {
     uint16_t mux_pwm0;     // 0x1102
     uint16_t mux_pwm1;     // 0x1121
     const char *mux_reg;   // "0x1f207994"
+    // SSE server
+    bool sse_enabled;
+    char sse_bind[128];
+    int sse_port;
+    char sse_path[64];
+    int sse_rate_hz;
 } cfg_t;
+
+typedef struct {
+    int fd;
+    char request[SSE_REQUEST_BUF];
+    size_t request_used;
+    char response[SSE_RESPONSE_BUF];
+    size_t response_len;
+    size_t response_off;
+    uint64_t deadline_ms;
+    int accepted;
+} sse_pending_client_t;
 
 typedef struct {
     int ch;                 // pwm index 0 or 1
@@ -98,14 +126,19 @@ static void usage(const char *argv0) {
         "  -v                    Verbose logs (packet + state)\n"
         "  -vv                   More detail (frame counters + output updates)\n"
         "  -vvv                  Very verbose (unchanged output skips)\n"
+        "  --sse                 Enable SSE server for channel telemetry\n"
+        "  --sse-bind HOST:PORT  SSE bind address (default 127.0.0.1:8070)\n"
+        "  --sse-path PATH       SSE HTTP path (default /sse)\n"
+        "  --sse-rate N          SSE emission rate in Hz, 1-100 (default 10)\n"
         "\n"
         "Examples:\n"
         "  %s --port 9000 --pwm0-ch 1 --pwm1-ch 2 -v\n"
         "  %s --pwm0-ch 4 --pwm1-ch 0 --center-timeout-ms 500\n"
         "  %s --no-mux --pwm0-ch 1 --pwm1-ch 2 -vv\n"
         "  %s --mux-reg 0x1f207994 --mux-pwm0 0x1102 --mux-pwm1 0x1121\n"
-        "  %s --mux-init-val 0x1122 --pwm0-ch 1 --pwm1-ch 2 -vv\n",
-        argv0, argv0, argv0, argv0, argv0, argv0);
+        "  %s --mux-init-val 0x1122 --pwm0-ch 1 --pwm1-ch 2 -vv\n"
+        "  %s --sse --sse-bind 0.0.0.0:8070 -v\n",
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static int parse_int(const char *s, int *out) {
@@ -439,6 +472,250 @@ static void log_udp_rx(int verbose, ssize_t n, const struct sockaddr_in *src, co
     }
 }
 
+// ---------------------------------------------------------------------------
+// SSE server (adapted from joystick2crsf)
+// ---------------------------------------------------------------------------
+
+static int set_nonblock(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int sse_send_all(int fd, const char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+        if (n > 0) { off += (size_t)n; continue; }
+        if (n == 0) return -1;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return (off == 0) ? 1 : -1;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int open_sse_listener(const char *host, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { perror("sse socket"); return -1; }
+
+    int one = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        fprintf(stderr, "SSE: invalid bind address '%s'\n", host);
+        close(fd);
+        return -1;
+    }
+
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        perror("sse bind");
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 4) != 0) {
+        perror("sse listen");
+        close(fd);
+        return -1;
+    }
+    set_nonblock(fd);
+    return fd;
+}
+
+static void sse_pending_reset(sse_pending_client_t *p) {
+    memset(p, 0, sizeof(*p));
+    p->fd = -1;
+}
+
+static void sse_pending_close(sse_pending_client_t *p) {
+    if (p->fd >= 0) close(p->fd);
+    sse_pending_reset(p);
+}
+
+static int sse_request_complete(const char *req) {
+    return strstr(req, "\r\n\r\n") || strstr(req, "\n\n");
+}
+
+static void sse_prepare_response(sse_pending_client_t *p, const char *path) {
+    static const char *headers =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: keep-alive\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "X-Accel-Buffering: no\r\n"
+        "\r\n"
+        ": waybeam-pwm\n\n";
+    static const char *reject =
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n\r\n";
+
+    p->accepted = 0;
+
+    char *line_end = strpbrk(p->request, "\r\n");
+    if (line_end) *line_end = '\0';
+
+    if (strncmp(p->request, "GET ", 4) != 0) {
+        snprintf(p->response, sizeof(p->response), "%s", reject);
+        p->response_len = strlen(p->response);
+        return;
+    }
+
+    char *uri = p->request + 4;
+    char *space = strchr(uri, ' ');
+    if (!space) {
+        snprintf(p->response, sizeof(p->response), "%s", reject);
+        p->response_len = strlen(p->response);
+        return;
+    }
+    *space = '\0';
+
+    if (path && path[0]) {
+        size_t plen = strlen(path);
+        if (strncmp(uri, path, plen) != 0 ||
+            (uri[plen] != '\0' && uri[plen] != '?' && uri[plen] != '#')) {
+            fprintf(stderr, "SSE: request for unexpected path '%s'\n", uri);
+            snprintf(p->response, sizeof(p->response), "%s", reject);
+            p->response_len = strlen(p->response);
+            return;
+        }
+    }
+
+    snprintf(p->response, sizeof(p->response), "%s", headers);
+    p->response_len = strlen(p->response);
+    p->accepted = 1;
+}
+
+static int sse_accept_pending(int listen_fd, sse_pending_client_t *pending, uint64_t now_ms) {
+    if (listen_fd < 0) return 0;
+
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    int cfd = accept(listen_fd, (struct sockaddr *)&addr, &addrlen);
+    if (cfd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
+        perror("sse accept");
+        return -1;
+    }
+
+    if (set_nonblock(cfd) < 0) { close(cfd); return 0; }
+
+    if (pending->fd >= 0) sse_pending_close(pending);
+
+    pending->fd = cfd;
+    pending->deadline_ms = now_ms + SSE_HANDSHAKE_TIMEOUT_MS;
+    pending->request_used = 0;
+    pending->response_len = 0;
+    pending->response_off = 0;
+    pending->accepted = 0;
+    return 1;
+}
+
+static int sse_service_pending(sse_pending_client_t *pending, int *client_fd,
+                               const char *path, uint64_t now_ms) {
+    if (pending->fd < 0) return 0;
+
+    // Receive HTTP request
+    if (pending->response_len == 0) {
+        while (pending->request_used < sizeof(pending->request) - 1U) {
+            ssize_t n = recv(pending->fd,
+                             pending->request + pending->request_used,
+                             (sizeof(pending->request) - 1U) - pending->request_used, 0);
+            if (n > 0) {
+                pending->request_used += (size_t)n;
+                pending->request[pending->request_used] = '\0';
+                if (sse_request_complete(pending->request)) {
+                    sse_prepare_response(pending, path);
+                    break;
+                }
+                continue;
+            }
+            if (n == 0) { sse_pending_close(pending); return 0; }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            sse_pending_close(pending); return 0;
+        }
+
+        if (pending->response_len == 0 &&
+            pending->request_used >= sizeof(pending->request) - 1U) {
+            sse_pending_close(pending);
+            return 0;
+        }
+    }
+
+    if (pending->response_len == 0) {
+        if (now_ms >= pending->deadline_ms) {
+            fprintf(stderr, "SSE: client handshake timed out\n");
+            sse_pending_close(pending);
+        }
+        return 0;
+    }
+
+    // Send HTTP response
+    while (pending->response_off < pending->response_len) {
+        ssize_t n = send(pending->fd,
+                         pending->response + pending->response_off,
+                         pending->response_len - pending->response_off,
+                         MSG_NOSIGNAL);
+        if (n > 0) { pending->response_off += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (now_ms >= pending->deadline_ms) {
+                fprintf(stderr, "SSE: client handshake timed out\n");
+                sse_pending_close(pending);
+            }
+            return 0;
+        }
+        sse_pending_close(pending); return 0;
+    }
+
+    if (!pending->accepted) { sse_pending_close(pending); return 0; }
+
+    // Promote to active client
+    if (*client_fd >= 0) close(*client_fd);
+    *client_fd = pending->fd;
+    pending->fd = -1;
+    sse_pending_reset(pending);
+    fprintf(stderr, "SSE: client connected\n");
+    return 1;
+}
+
+static int sse_send_channels(int fd, const int ch_us[16], bool link_active,
+                             bool failsafe, size_t rc_frames) {
+    if (fd < 0) return 0;
+
+    // Convert microseconds back to CRSF ticks for waybeam_hub compatibility
+    int ticks[16];
+    for (int i = 0; i < 16; i++)
+        ticks[i] = ((ch_us[i] - 1500) * 8) / 5 + 992;
+
+    char buf[512];
+    int off = snprintf(buf, sizeof(buf),
+        "event: serial\ndata: {\"stream\":\"serial\",\"channels\":[");
+    if (off < 0 || off >= (int)sizeof(buf)) return -1;
+
+    for (int i = 0; i < 16; i++) {
+        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+                        i ? ",%d" : "%d", ticks[i]);
+        if (off < 0 || off >= (int)sizeof(buf)) return -1;
+    }
+
+    off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        "],\"link\":%s,\"rc_frames\":%zu,\"failsafe\":%s}\n\n",
+        link_active ? "true" : "false", rc_frames,
+        failsafe ? "true" : "false");
+    if (off < 0 || off >= (int)sizeof(buf)) return -1;
+
+    return sse_send_all(fd, buf, (size_t)off);
+}
+
 int main(int argc, char **argv) {
     cfg_t cfg = {
         .port = 9000,
@@ -457,6 +734,11 @@ int main(int argc, char **argv) {
         .mux_pwm0 = 0x1102,
         .mux_pwm1 = 0x1121,
         .mux_reg = "0x1f207994",
+        .sse_enabled = false,
+        .sse_bind = SSE_DEFAULT_BIND,
+        .sse_port = SSE_DEFAULT_PORT,
+        .sse_path = SSE_DEFAULT_PATH,
+        .sse_rate_hz = SSE_DEFAULT_RATE_HZ,
     };
     bool mux_strategy_explicit = false;
 
@@ -500,6 +782,39 @@ int main(int argc, char **argv) {
             if (!parse_opt_u16_or_die(argc, argv, &i, &cfg.mux_init_val, "--mux-init-val")) return 1;
             cfg.mux_init_once = true;
             mux_strategy_explicit = true;
+        } else if (!strcmp(argv[i], "--sse")) {
+            cfg.sse_enabled = true;
+        } else if (!strcmp(argv[i], "--sse-bind")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --sse-bind\n");
+                return 1;
+            }
+            const char *val = argv[++i];
+            const char *colon = strrchr(val, ':');
+            if (colon && colon != val) {
+                size_t hlen = (size_t)(colon - val);
+                if (hlen >= sizeof(cfg.sse_bind)) hlen = sizeof(cfg.sse_bind) - 1;
+                memcpy(cfg.sse_bind, val, hlen);
+                cfg.sse_bind[hlen] = '\0';
+                int port_val = 0;
+                if (parse_int(colon + 1, &port_val) != 0 || port_val <= 0 || port_val > 65535) {
+                    fprintf(stderr, "Invalid SSE port in '%s'\n", val);
+                    return 1;
+                }
+                cfg.sse_port = port_val;
+            } else {
+                snprintf(cfg.sse_bind, sizeof(cfg.sse_bind), "%s", val);
+            }
+        } else if (!strcmp(argv[i], "--sse-path")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --sse-path\n");
+                return 1;
+            }
+            snprintf(cfg.sse_path, sizeof(cfg.sse_path), "%s", argv[++i]);
+        } else if (!strcmp(argv[i], "--sse-rate")) {
+            if (!parse_opt_int_or_die(argc, argv, &i, &cfg.sse_rate_hz, "--sse-rate")) return 1;
+            if (cfg.sse_rate_hz < 1) cfg.sse_rate_hz = 1;
+            if (cfg.sse_rate_hz > 100) cfg.sse_rate_hz = 100;
         }
         else if (argv[i][0] == '-' && argv[i][1] == 'v') {
             const char *p = &argv[i][1];
@@ -578,6 +893,29 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // SSE server setup
+    int sse_listen_fd = -1;
+    int sse_client_fd = -1;
+    sse_pending_client_t sse_pending;
+    sse_pending_reset(&sse_pending);
+    uint64_t next_sse_emit_ms = 0;
+    size_t total_rc_frames = 0;
+    int last_ch_us[16];
+    for (int i = 0; i < 16; i++) last_ch_us[i] = cfg.center_us;
+
+    if (cfg.sse_enabled) {
+        sse_listen_fd = open_sse_listener(cfg.sse_bind, cfg.sse_port);
+        if (sse_listen_fd < 0) {
+            fprintf(stderr, "Failed to open SSE listener on %s:%d\n", cfg.sse_bind, cfg.sse_port);
+            close(sock);
+            return 1;
+        }
+        if (cfg.verbose) {
+            fprintf(stderr, "SSE: listening on %s:%d%s @ %dHz\n",
+                    cfg.sse_bind, cfg.sse_port, cfg.sse_path, cfg.sse_rate_hz);
+        }
+    }
+
     if (cfg.verbose) {
         fprintf(stderr,
                 "Listening UDP :%d | pwm0<-CH%d pwm1<-CH%d | %dHz | clamp %d..%dus | center %dus | hold %dms center@%dms\n",
@@ -639,6 +977,8 @@ int main(int argc, char **argv) {
                     last_valid_ms = now;
                     link_active = true;
                     centered_due_to_timeout = false;
+                    total_rc_frames += res.rc_frames;
+                    memcpy(last_ch_us, res.ch_us, sizeof(last_ch_us));
 
                     if (cfg.pwm0_ch > 0 && pwm0.available) {
                         int raw_us = res.ch_us[cfg.pwm0_ch - 1];
@@ -680,6 +1020,25 @@ int main(int argc, char **argv) {
             }
         }
 
+        // SSE: accept connections, complete handshakes, emit channel data
+        if (sse_listen_fd >= 0) {
+            sse_accept_pending(sse_listen_fd, &sse_pending, now);
+            sse_service_pending(&sse_pending, &sse_client_fd, cfg.sse_path, now);
+
+            if (sse_client_fd >= 0 && now >= next_sse_emit_ms) {
+                int rc = sse_send_channels(sse_client_fd, last_ch_us,
+                                           link_active, centered_due_to_timeout,
+                                           total_rc_frames);
+                if (rc < 0) {
+                    if (cfg.verbose) fprintf(stderr, "SSE: client disconnected\n");
+                    close(sse_client_fd);
+                    sse_client_fd = -1;
+                } else {
+                    next_sse_emit_ms = now + (uint64_t)(1000 / cfg.sse_rate_hz);
+                }
+            }
+        }
+
         // Failsafe logic:
         // 0..hold_ms after last frame: hold last command
         // >= center_timeout_ms: center outputs
@@ -703,6 +1062,9 @@ int main(int argc, char **argv) {
 
     if (cfg.verbose) fprintf(stderr, "Stopping, centering outputs...\n");
     pwm_center_all(&cfg, &pwm0, &pwm1);
+    if (sse_client_fd >= 0) close(sse_client_fd);
+    if (sse_pending.fd >= 0) close(sse_pending.fd);
+    if (sse_listen_fd >= 0) close(sse_listen_fd);
     close(sock);
     return 0;
 }
