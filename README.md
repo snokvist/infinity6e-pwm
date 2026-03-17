@@ -96,6 +96,35 @@ devmem 0x1f207994 16 0x01121
 ./waybeam-pwm --port 8999 --pwm0-ch 1 --pwm1-ch 2 --mux-init-val 0x1122 -vv
 ```
 
+## UART2 (TTY2) to PWM Conversion
+
+The Infinity6E UART2 TX/RX pins can be repurposed as two PWM outputs by switching
+the pad function register before the normal PWM mux setup.
+
+Register `0x1F207890` controls UART2 pad function. Writing `0x0008` switches
+the pins from UART mode to PWM mode:
+
+```sh
+devmem 0x1f207890 16 0x0008
+```
+
+Both tools support this via `--pad-mux`:
+
+```sh
+# Shell helper
+./infinity6e_pwm.sh pwm0 --pad-mux 0x1f207890 0x0008 center
+
+# waybeam-pwm daemon
+./waybeam-pwm --pad-mux 0x1f207890 0x0008 --pwm0-ch 1 --pwm1-ch 2 -vv
+```
+
+The `--pad-mux` write happens first at startup (pin function switch), then the
+normal PWM channel mux at `0x1f207994` routes the PWM signals.
+
+**Note:** UART2 (TTY2) will no longer be available as a serial port while the
+pins are configured for PWM. Revert by writing the original value back to
+`0x1F207890`.
+
 ## Dual-Channel Mux Behavior And Fix
 
 Observed behavior:

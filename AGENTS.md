@@ -75,3 +75,8 @@ This repository contains a standalone Buildroot package that patches SigmaStar I
 - 2026-02-20: Documented resolved dual-channel behavior.
 - Behavior: dual-channel previously activated only one output due to per-channel mux overwrite on shared register.
 - Fix: default to one-shot combined mux write (`0x1122`) for dual-channel startup, with explicit override options preserved.
+- 2026-03-17: Added UART2 (TTY2) to PWM conversion support.
+- New `--pad-mux ADDR VAL` option in both `waybeam-pwm.c` and `infinity6e_pwm.sh`.
+- Pad-mux register `0x1F207890` with value `0x0008` switches UART2 pins to PWM function.
+- Pad-mux write executes before PWM channel mux (`0x1f207994`) at startup.
+- Two-stage mux: (1) pad function select, (2) PWM channel routing.

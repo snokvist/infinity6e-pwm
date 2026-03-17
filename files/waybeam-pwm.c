@@ -60,6 +60,10 @@ typedef struct {
     uint16_t mux_pwm0;     // 0x1102
     uint16_t mux_pwm1;     // 0x1121
     const char *mux_reg;   // "0x1f207994"
+    // Optional pad-mux: repurpose UART/other pins to PWM function
+    bool pad_mux_set;
+    const char *pad_mux_reg; // e.g. "0x1f207890"
+    uint16_t pad_mux_val;    // e.g. 0x0008
     // SSE server
     bool sse_enabled;
     char sse_bind[128];
@@ -129,6 +133,8 @@ static void usage(const char *argv0) {
         "  --mux-pwm1 VAL        Mux write value for pwm1 init (default 0x1121)\n"
         "  --mux-init-val VAL    One-shot mux write at startup; skips per-channel mux writes\n"
         "                        (default auto for dual-channel: 0x1122)\n"
+        "  --pad-mux ADDR VAL   Write pad-mux register before PWM mux (e.g. UART2->PWM:\n"
+        "                        --pad-mux 0x1f207890 0x0008)\n"
         "  -v                    Verbose logs (packet + state)\n"
         "  -vv                   More detail (frame counters + output updates)\n"
         "  -vvv                  Very verbose (unchanged output skips)\n"
@@ -143,8 +149,9 @@ static void usage(const char *argv0) {
         "  %s --no-mux --pwm0-ch 1 --pwm1-ch 2 -vv\n"
         "  %s --mux-reg 0x1f207994 --mux-pwm0 0x1102 --mux-pwm1 0x1121\n"
         "  %s --mux-init-val 0x1122 --pwm0-ch 1 --pwm1-ch 2 -vv\n"
-        "  %s --sse --sse-bind 0.0.0.0:8070 -v\n",
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+        "  %s --sse --sse-bind 0.0.0.0:8070 -v\n"
+        "  %s --pad-mux 0x1f207890 0x0008 --pwm0-ch 1 --pwm1-ch 2 -vv\n",
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static int parse_int(const char *s, int *out) {
@@ -740,6 +747,9 @@ int main(int argc, char **argv) {
         .mux_pwm0 = 0x1102,
         .mux_pwm1 = 0x1121,
         .mux_reg = "0x1f207994",
+        .pad_mux_set = false,
+        .pad_mux_reg = NULL,
+        .pad_mux_val = 0,
         .sse_enabled = false,
         .sse_bind = SSE_DEFAULT_BIND,
         .sse_port = SSE_DEFAULT_PORT,
@@ -788,6 +798,14 @@ int main(int argc, char **argv) {
             if (!parse_opt_u16_or_die(argc, argv, &i, &cfg.mux_init_val, "--mux-init-val")) return 1;
             cfg.mux_init_once = true;
             mux_strategy_explicit = true;
+        } else if (!strcmp(argv[i], "--pad-mux")) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "Missing ADDR VAL for --pad-mux\n");
+                return 1;
+            }
+            cfg.pad_mux_reg = argv[++i];
+            if (!parse_opt_u16_or_die(argc, argv, &i, &cfg.pad_mux_val, "--pad-mux VAL")) return 1;
+            cfg.pad_mux_set = true;
         } else if (!strcmp(argv[i], "--sse")) {
             cfg.sse_enabled = true;
         } else if (!strcmp(argv[i], "--sse-bind")) {
@@ -859,6 +877,22 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
 
+    // Pad-mux: switch pin function (e.g. UART2 -> PWM) before PWM channel routing
+    if (cfg.pad_mux_set) {
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "devmem %s 16 0x%04x >/dev/null 2>&1",
+                 cfg.pad_mux_reg, cfg.pad_mux_val);
+        if (system(cmd) != 0) {
+            if (cfg.verbose) {
+                fprintf(stderr, "WARN: pad-mux write failed for %s=0x%04x (continuing)\n",
+                        cfg.pad_mux_reg, cfg.pad_mux_val);
+            }
+        } else if (cfg.verbose) {
+            fprintf(stderr, "PAD-MUX: %s = 0x%04x (pin function switch)\n",
+                    cfg.pad_mux_reg, cfg.pad_mux_val);
+        }
+    }
+
     if (!cfg.no_mux && cfg.mux_init_once) {
         if (sigma_mux_set_value(&cfg, cfg.mux_init_val) != 0) {
             if (cfg.verbose) {
@@ -927,6 +961,9 @@ int main(int argc, char **argv) {
                 "Listening UDP :%d | pwm0<-CH%d pwm1<-CH%d | %dHz | clamp %d..%dus | center %dus | hold %dms center@%dms\n",
                 cfg.port, cfg.pwm0_ch, cfg.pwm1_ch, cfg.hz, cfg.min_us, cfg.max_us, cfg.center_us,
                 cfg.hold_ms, cfg.center_timeout_ms);
+        if (cfg.pad_mux_set) {
+            fprintf(stderr, "PAD-MUX: %s = 0x%04x\n", cfg.pad_mux_reg, cfg.pad_mux_val);
+        }
         if (cfg.no_mux) {
             fprintf(stderr, "MUX mode: disabled (--no-mux)\n");
         } else if (cfg.mux_init_once) {

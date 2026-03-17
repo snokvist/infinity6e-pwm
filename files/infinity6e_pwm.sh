@@ -22,6 +22,8 @@ set -eu
 
 PWMCHIP="/sys/class/pwm/pwmchip0"
 MUX_REG="0x1f207994"
+PAD_MUX_REG=""
+PAD_MUX_VAL=""
 
 # Defaults
 HZ=50
@@ -57,11 +59,14 @@ Options:
   --max-us N          Max pulse width in us (default: $MAX_US)
   --step-us N         Sweep step size in us (default: $STEP_US)
   --step-delay-ms N   Delay between sweep steps (default: $STEP_DELAY_MS)
+  --pad-mux ADDR VAL  Write pad-mux register before PWM mux
+                      (e.g. UART2->PWM: --pad-mux 0x1f207890 0x0008)
 
 Examples:
   $0 pwm0 center
   $0 pwm0 us 1450
   $0 pwm0 --hz 50 --min-us 900 --center-us 1500 --max-us 2100 sweep
+  $0 pwm0 --pad-mux 0x1f207890 0x0008 center
   $0 pwm1 pct 8
 EOF
   exit 1
@@ -86,6 +91,7 @@ while [ $# -gt 0 ]; do
     --max-us) [ $# -ge 2 ] || usage; MAX_US="$2"; shift 2 ;;
     --step-us) [ $# -ge 2 ] || usage; STEP_US="$2"; shift 2 ;;
     --step-delay-ms) [ $# -ge 2 ] || usage; STEP_DELAY_MS="$2"; shift 2 ;;
+    --pad-mux) [ $# -ge 3 ] || usage; PAD_MUX_REG="$2"; PAD_MUX_VAL="$3"; shift 3 ;;
     *) break ;;
   esac
 done
@@ -119,6 +125,9 @@ pct_to_us() {
 }
 
 ensure_pwm() {
+  if [ -n "$PAD_MUX_REG" ] && [ -n "$PAD_MUX_VAL" ]; then
+    devmem "$PAD_MUX_REG" 16 "$PAD_MUX_VAL" >/dev/null
+  fi
   devmem "$MUX_REG" 16 "$MUX_VAL" >/dev/null
   [ -d "$P" ] || echo "$CH" > "$PWMCHIP/export"
 
@@ -165,6 +174,10 @@ print_info() {
   rb_enable="$(cat "$P/enable" 2>/dev/null || echo '?')"
 
   echo "PWM:      $PWM_NAME (CH=$CH)"
+  if [ -n "$PAD_MUX_REG" ]; then
+    rb_pad="$(devmem "$PAD_MUX_REG" 16 2>/dev/null || echo '?')"
+    echo "PAD-MUX:  $PAD_MUX_REG = $rb_pad (target $PAD_MUX_VAL)"
+  fi
   echo "MUX:      $MUX_REG = $rb_mux (target $MUX_VAL)"
   echo "Freq:     ${rb_period} Hz"
   echo "Enable:   $rb_enable"
