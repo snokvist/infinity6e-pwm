@@ -75,3 +75,12 @@ This repository contains a standalone Buildroot package that patches SigmaStar I
 - 2026-02-20: Documented resolved dual-channel behavior.
 - Behavior: dual-channel previously activated only one output due to per-channel mux overwrite on shared register.
 - Fix: default to one-shot combined mux write (`0x1122`) for dual-channel startup, with explicit override options preserved.
+
+## Codex delegation
+
+OpenAI Codex is available via the `codex@openai-codex` Claude Code plugin for
+verification and token offload. Use `/codex:review` or
+`/codex:adversarial-review` for second-opinion passes, and `/codex:rescue`
+(optionally `--background`) to delegate heavy reads, full-repo greps, or
+self-contained investigations. The workflow spec lives in the coordination
+repo at `docs/codex-workflow.md`.
